@@ -6,9 +6,9 @@
 - Rely on the 4Mica sdk for tabs/guarantees storage; do not persist certificates in Aligned.
 
 ## References (checked)
-- 4Mica SDK (`rust-sdk-4mica`): Recipient-side helpers verify BLS certs (`RecipientClient::verify_payment_guarantee`) and can remunerate if a user defaults (`RecipientClient::remunerate`). Guarantees carry `claims` + `signature`, include domain, recipient, asset, amount, tab_id, req_id, timestamp.
-- 4Mica core : Guarantees = BLS certs over `PaymentGuaranteeClaims`; tabs have TTL then a 7-day settlement window before remuneration is allowed.
-- 4Mica payment gateway (`x402.4mica.xyz`): HTTP API exposes `/supported`, `/verify`, `/settle`, `/tabs`; `/settle` issues a BLS certificate (claims+signature) after validating the payment header against requirements; `/tabs` opens/reuses tabs via core; gateway enforces scheme/network/payTo/asset/amount.
+- 4Mica SDK (`rust-sdk-4mica`): Recipient-side helpers verify BLS certs (`RecipientClient::verify_payment_guarantee`) and can remunerate if a user defaults (`RecipientClient::remunerate`). `verify_payment_guarantee` checks the BLS signature + optional domain and returns `PaymentGuaranteeClaims { domain, user_address, recipient_address, tab_id, req_id, amount, total_amount, asset_address, timestamp, version }`. Business rules (recipient/asset/amount/TTL) are not enforced in the helper and must be validated by the caller.
+- 4Mica core: Guarantees = BLS certs over `PaymentGuaranteeClaims`; `req_id` is assigned sequentially per tab during issuance and `total_amount` accumulates all guarantees on that tab. Issuance validates the signature scheme, asset match, and that the claims timestamp sits inside the tab window (tab TTL defaults to 24h). There is no extra “settlement window” delay before remuneration; a recipient can call `remunerate` as soon as a certificate exists.
+- 4Mica payment gateway (`x402.4mica.xyz`): HTTP API exposes `/supported`, `/verify`, `/settle`, `/tabs`, `/health`. `/settle` posts to core `/core/guarantees`, then re-verifies the returned certificate (signature + optional domain) before replying; it enforces scheme/network/payTo/asset and requires `amount == maxAmountRequired`. `/tabs` forwards to `/core/payment-tabs`, returns a hex `tabId`, and stamps `startTimestamp` as “now” with `ttlSeconds` coming from the request (no tab lookup endpoints are exposed).
 
 ## Payment Options UX
 - CLI/SDK/API add `--payment-method` (or equivalent) with options:
@@ -23,26 +23,27 @@
   - On submission, require a BLS certificate payload (claims+signature) from the 4Mica gateway.
   - Validate off-chain with `rust-sdk-4mica`:
     - `RecipientClient::verify_payment_guarantee(cert)` for signature/domain/operator key.
-    - Business checks: recipient = configured Aligned payee, amount ≥ required per-proof fee (and expected asset/network), timestamp/TTL still valid. (TODO: add these to sdk for checking)
+    - Business checks: recipient = configured Aligned payee, asset/network match expectations, amount equals the required per-proof fee (gateway enforces equality), timestamp/TTL still valid. (TODO: add a helper that pulls tab TTL + settlement policy from core and validates claims/timestamps/amount/recipient in one place)
+    - Consider `total_amount` to cap cumulative credit granted per tab. (TODO)
   - If valid, accept the proof into the batch; skip escrow balance deduction. Aggregator gas funding stays as today (batcher wallet).
 
 
 ## Aggregator Behavior
-- If a user defaults after the tab TTL + 7-day settlement window should ops (or a future job) fetch the cert from the 4Mica gateway/core and call `RecipientClient::remunerate(cert)` to claim collateral. This is an exceptional/default-recovery path.
+- Remuneration is callable immediately after a certificate is issued; define the policy (e.g., wait until tab TTL elapses) before slashing collateral. (TODO)
+- If a user defaults after that policy threshold, ops (or a future job) should fetch the cert (from gateway/core or the submission payload) and call `RecipientClient::remunerate(cert)` to claim collateral. This is an exceptional/default-recovery path.
 
 ## 4Mica Gateway Expectations
 - Provide to clients/operators:
-  - `POST /tabs` to open/reuse tabs (user+recipient+asset+TTL).
-  - `GET /tabs/{id}` and `GET /tabs?user=...&settled=false` for unsettled tabs.
-  - `POST /settle` (or `/guarantees` if added) to issue BLS certificates; response includes `{certificate: {claims, signature}, tabId, amount, ttl}`.
-  - Optional `/verify` for preflight of headers.
-- Enforce scheme/network/payTo/asset/amount/TTL. 
+  - `GET /supported`, `POST /verify` (preflight), `POST /settle` (returns `{certificate: {claims, signature}}`), `POST /tabs` (open/reuse tab), `GET /health`.
+  - `POST /settle` enforces scheme/network/payTo/asset/amount equality and re-validates the certificate against the operator public key (and optional configured domain).
+  - `POST /tabs` currently returns `{tabId, userAddress, recipientAddress, assetAddress, startTimestamp, ttlSeconds}` derived locally (start time = now, ttlSeconds = request or 0). No GET/tab lookup endpoints exist yet. (TODO: add tab retrieval/lookup if Aligned needs to refresh TTL or certificates)
+- Enforce scheme/network/payTo/asset/amount. 
 
 
 ## 4Mica Adapter in Aligned
 - New module in the batcher service that uses `rust-sdk-4mica`:
-  - Verify certificates during submission (signature, domain, recipient, amount, TTL).
-  - Optionally fetch certs on-demand from gateway when initiating remuneration (only on default).
+  - Verify certificates during submission (signature, domain, recipient, asset, amount, TTL policy, `total_amount` cap).
+  - Optionally fetch certs on-demand from gateway when initiating remuneration (only on default). (TODO: decide storage vs. fetch policy)
 
 ## Docs & Config
 - Add CLI/SDK doc snippet: `aligned submit ... --payment-method 4mica-credit --guarantee path/to/cert.json`.
