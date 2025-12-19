@@ -4,6 +4,7 @@
 - Preserve the existing prepaid ETH escrow flow (BatcherPaymentService) as the default when no payment method is specified.
 - Add a 4Mica guarantee-based path where a BLS certificate from 4Mica is accepted as payment (no on-chain deposit in Aligned for that path).
 - Rely on the 4Mica sdk for tabs/guarantees storage; do not persist certificates in Aligned.
+- Make the “can I pay?” check instant (off-chain) while keeping task creation/response on-chain.
 
 ## References (checked)
 - 4Mica SDK (`rust-sdk-4mica`): Recipient-side helpers verify BLS certs (`RecipientClient::verify_payment_guarantee`) and can remunerate if a user defaults (`RecipientClient::remunerate`). `verify_payment_guarantee` checks the BLS signature + optional domain and returns `PaymentGuaranteeClaims { domain, user_address, recipient_address, tab_id, req_id, amount, total_amount, asset_address, timestamp, version }`. Business rules (recipient/asset/amount/TTL) are not enforced in the helper and must be validated by the caller.
@@ -17,6 +18,11 @@
   - `x402-exact` / `other`: reserved for future.
 - If no method is provided, run the current escrow path.
 
+## Where things run (on-chain vs off-chain)
+- On-chain (unchanged): ServiceManager `createNewTask` and `respondToTaskV2`, escrow deposits/withdrawals in `BatcherPaymentService`, aggregator reimbursement inside `respondToTaskV2`.
+- Off-chain (4Mica): certificate issuance/validation (gateway + `rust-sdk-4mica`), fee authorization for each proof, and any default-side remuneration job.
+- Result: task submission still waits for L1 inclusion, but “prove ability to pay” is instant because it is checked with an off-chain BLS certificate instead of an on-chain deposit.
+
 ## Aligned Flow (no contract changes)
 - Escrow path: unchanged balance checks and `createNewTask`.
 - 4Mica path:
@@ -25,7 +31,8 @@
     - `RecipientClient::verify_payment_guarantee(cert)` for signature/domain/operator key.
     - Business checks: recipient = configured Aligned payee, asset/network match expectations, amount equals the required per-proof fee (gateway enforces equality), timestamp/TTL still valid. (TODO: add a helper that pulls tab TTL + settlement policy from core and validates claims/timestamps/amount/recipient in one place)
     - Consider `total_amount` to cap cumulative credit granted per tab. (TODO)
-  - If valid, accept the proof into the batch; skip escrow balance deduction. Aggregator gas funding stays as today (batcher wallet).
+  - If valid, accept the proof into the batch; skip escrow balance deduction. Aggregator gas funding stays as today (batcher wallet → on-chain transfer when `respondToTaskV2` runs).
+  - ServiceManager `createNewTask` still posts the task on-chain; only the payment proof step is moved off-chain, so the user experience is faster but consensus latency is unchanged.
 
 
 ## Aggregator Behavior
